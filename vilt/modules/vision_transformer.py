@@ -457,6 +457,8 @@ class VisionTransformer(nn.Module):
         """
         super().__init__()
         drop_rate = drop_rate if config is None else config["drop_rate"]
+        img_size = img_size if config is None else config['image_size']
+        drop_path_rate = drop_path_rate if config is None else config.get('drop_path_rate', 0.)
 
         self.num_classes = num_classes
         self.num_features = (
