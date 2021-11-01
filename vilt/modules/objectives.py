@@ -6,6 +6,7 @@ import glob
 import json
 import tqdm
 import functools
+import logging
 
 from torch.utils.data.distributed import DistributedSampler
 from einops import rearrange
@@ -86,17 +87,78 @@ def optimal_transport_dist(
     distance = trace(cost.matmul(T.detach()))
     return distance
 
+def compute_seq2seq(pl_module, batch):
+    if pl_module.training:
+        infer = pl_module.infer(batch, mask_text=True, mask_image=False,
+                                seq2seq=True)
+        #with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
+        seq2seq_logits = pl_module.seq2seq_score(infer["text_feats"])
+        seq2seq_labels = infer["text_labels"]
+
+        logits = seq2seq_logits.view(-1, pl_module.hparams.config["vocab_size"])
+        target = seq2seq_labels.view(-1)
+
+        valid = target != -100
+        logits = logits[valid]
+        target = target[valid]
+
+        logits = logits.float()
+        if len(target) == 0:
+            seq2seq_loss = torch.tensor(0., device=logits.device, requires_grad=True)
+        else:
+            seq2seq_loss = pl_module.seq_loss(logits, target)
+
+        ret = {
+            "seq_loss": seq2seq_loss,
+            "seq_logits": seq2seq_logits,
+            "seq_labels": seq2seq_labels,
+            "seq_ids": infer["text_ids"],
+        }
+        if pl_module.hparams.config.get('ema_distill_seq'):
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=True):
+                    ma_infer = pl_module.infer(batch, mask_text=True, mask_image=False,
+                                            seq2seq=True)
+                    ma_seq2seq_logits = pl_module.seq2seq_score(ma_infer["text_feats"])
+                    ma_logits = ma_seq2seq_logits.view(-1, pl_module.hparams.config["vocab_size"])
+                    ma_logits = ma_logits[valid]
+                    ma_logits = ma_logits.float()
+            ma_seq2seq_loss = torch.nn.functional.kl_div(
+                logits.log_softmax(dim=1),
+                ma_logits.log_softmax(dim=1),
+                reduction='batchmean',
+                log_target=True,
+            )
+            weight = pl_module.hparams.config.get('ema_distill_seq_weight', 1)
+            ret['ma_seq_loss'] = ma_seq2seq_loss * weight
+    else:
+        # not ready
+        image_embeds, image_masks = pl_module.encode_image(batch['img'][0])
+        ret = pl_module.generate(
+            img_feats=image_embeds,
+            **pl_module.caption_test_extra_input,
+        )
+
+    return ret
 
 def compute_mlm(pl_module, batch):
     infer = pl_module.infer(batch, mask_text=True, mask_image=False)
+
+    #with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
     mlm_logits = pl_module.mlm_score(infer["text_feats"])
     mlm_labels = infer["text_labels"]
 
-    mlm_loss = F.cross_entropy(
-        mlm_logits.view(-1, pl_module.hparams.config["vocab_size"]),
-        mlm_labels.view(-1),
-        ignore_index=-100,
-    )
+    logits = mlm_logits.view(-1, pl_module.hparams.config["vocab_size"])
+    target = mlm_labels.view(-1)
+    valid = target != -100
+    logits = logits[valid]
+    target = target[valid]
+
+    logits = logits.float()
+    if len(target) == 0:
+        mlm_loss = torch.tensor(0., device=logits.device, requires_grad=True)
+    else:
+        mlm_loss = pl_module.mlm_loss(logits, target)
 
     ret = {
         "mlm_loss": mlm_loss,
@@ -105,16 +167,49 @@ def compute_mlm(pl_module, batch):
         "mlm_ids": infer["text_ids"],
     }
 
-    phase = "train" if pl_module.training else "val"
-    loss = getattr(pl_module, f"{phase}_mlm_loss")(ret["mlm_loss"])
-    acc = getattr(pl_module, f"{phase}_mlm_accuracy")(
-        ret["mlm_logits"], ret["mlm_labels"]
-    )
-    pl_module.log(f"mlm/{phase}/loss", loss)
-    pl_module.log(f"mlm/{phase}/accuracy", acc)
+    if pl_module.hparams.config.get('ema_distill_mlm'):
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_infer = pl_module.ma_teacher.infer(batch, mask_text=True, mask_image=False)
+                ma_mlm_logits = pl_module.ma_teacher.mlm_score(ma_infer["text_feats"])
+                ma_logits = ma_mlm_logits.view(-1, pl_module.hparams.config["vocab_size"])
+                ma_logits = ma_logits[valid]
+                ma_logits = ma_logits.float()
+        ma_mlm_loss = torch.nn.functional.kl_div(
+            logits.log_softmax(dim=1),
+            ma_logits.log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config.get('ema_distill_mlm_weight') or 1.
+        ret['ma_mlm_loss'] = ma_mlm_loss * weight
 
     return ret
 
+def compute_decoder(pl_module, batch):
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+
+    ret = infer
+
+    if pl_module.hparams.config.get('ema_distill_mlm'):
+        raise NotImplementedError('not ready')
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_infer = pl_module.ma_teacher.infer(batch, mask_text=True, mask_image=False)
+                ma_mlm_logits = pl_module.ma_teacher.mlm_score(ma_infer["text_feats"])
+                ma_logits = ma_mlm_logits.view(-1, pl_module.hparams.config["vocab_size"])
+                ma_logits = ma_logits[valid]
+                ma_logits = ma_logits.float()
+        ma_mlm_loss = torch.nn.functional.kl_div(
+            logits.log_softmax(dim=1),
+            ma_logits.log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config.get('ema_distill_mlm_weight') or 1.
+        ret['ma_mlm_loss'] = ma_mlm_loss * weight
+
+    return ret
 
 def compute_mpp(pl_module, batch):
     infer = pl_module.infer(batch, mask_text=False, mask_image=True)
@@ -199,31 +294,179 @@ def compute_mpfr(pl_module, batch):
 
 
 def compute_itm_wpa(pl_module, batch):
+    if pl_module.training:
+        return compute_itm_wpa_train(pl_module, batch)
+    else:
+        return compute_itm_wpa_test(pl_module, batch)
+
+def compute_itm(pl_module, batch):
     pos_len = len(batch["text"]) // 2
     neg_len = len(batch["text"]) - pos_len
+    batch = {k: v for k, v in batch.items()}
     itm_labels = torch.cat([torch.ones(pos_len), torch.zeros(neg_len)]).to(
         pl_module.device
     )
     itm_labels = itm_labels[torch.randperm(itm_labels.size(0))]
+    num_res_factors = len(pl_module.hparams.config['multi_res_factors'])
+    if 'false_image_0' not in batch:
+        if num_res_factors == 0:
+            rand_idx = torch.randperm(len(batch['image'][0]))
+            batch['false_image_0'] = [batch['image'][0][rand_idx]]
+            batch['correct_false'] = (batch['idx_img'] != batch['idx_img'][rand_idx]).long()
+        else:
+            num_image = len(batch['image'][0])
+            shuffle_len = num_image // 2 + 1
+            idx = torch.cat((torch.randperm(shuffle_len), torch.arange(shuffle_len, num_image)))
+            batch['image'] = [batch['image'][0][idx]]
+            for i in range(num_res_factors):
+                k = 'image_{}'.format(i)
+                batch[k] = [batch[k][0][idx]]
+            batch['correct_false'] = (batch['idx_img'] != batch['idx_img'][idx]).long()
+    else:
+        assert num_res_factors == 0
+
     if 'correct_false' in batch:
         # we need to overwrite itm_labels
         # (itm_label, correct_false): (0, 1) -> 1 and -> 0 otherwise
         itm_labels = 1 - (1 - itm_labels) * batch['correct_false']
 
-    itm_images = [
-        torch.stack(
-            [
-                ti if itm_labels[i] == 1 else fi
-                for i, (ti, fi) in enumerate(zip(bti, bfi))
-            ]
-        )
-        for bti, bfi in zip(batch["image"], batch["false_image_0"])
-    ]
-
-    batch = {k: v for k, v in batch.items()}
-    batch["image"] = itm_images
+    if num_res_factors == 0:
+        itm_images = [
+            torch.stack(
+                [
+                    ti if itm_labels[i] == 1 else fi
+                    for i, (ti, fi) in enumerate(zip(bti, bfi))
+                ]
+            )
+            for bti, bfi in zip(batch["image"], batch["false_image_0"])
+        ]
+        batch["image"] = itm_images
 
     infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+
+    #with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
+    itm_logits = pl_module.itm_score(infer["cls_feats"])
+    itm_logits = itm_logits.float()
+    #itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
+    itm_loss = pl_module.itm_loss(itm_logits, itm_labels.long())
+    ret = {
+        'itm_loss': itm_loss,
+        'itm_logits': itm_logits,
+    }
+
+    if pl_module.ma_teacher and pl_module.hparams.config.get('ema_distill_itm'):
+        with torch.no_grad():
+            ma_infer = pl_module.ma_teacher.infer(batch, mask_text=False, mask_image=False)
+            ma_itm_logits = pl_module.ma_teacher.itm_score(ma_infer["cls_feats"])
+            ma_itm_logits = ma_itm_logits.float()
+        ma_itm_loss = torch.nn.functional.kl_div(
+            itm_logits.log_softmax(dim=1),
+            ma_itm_logits.log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config.get('ma_itm_loss_weight', 1)
+        ret['ma_itm_loss'] = ma_itm_loss * weight
+
+    return ret
+
+def compute_itm_wpa_test(pl_module, batch):
+    pos_len = len(batch["text"]) // 2
+    neg_len = len(batch["text"]) - pos_len
+    batch = {k: v for k, v in batch.items()}
+    itm_labels = torch.cat([torch.ones(pos_len), torch.zeros(neg_len)]).to(
+        pl_module.device
+    )
+    itm_labels = itm_labels[torch.randperm(itm_labels.size(0))]
+
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+
+    for k in ['text_feats', 'image_feats']:
+        infer[k] = infer[k].float()
+
+    itm_logits = pl_module.itm_score(infer["cls_feats"])
+    itm_logits = itm_logits.float()
+    #itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
+    #itm_loss = pl_module.itm_loss(itm_logits, itm_labels.long())
+
+    ret = {
+        #"itm_loss": itm_loss,
+        "itm_logits": itm_logits,
+        #"itm_labels": itm_labels,
+    }
+
+    return ret
+
+def compute_itm_wpa_train(pl_module, batch):
+    pos_len = len(batch["text"]) // 2
+    neg_len = len(batch["text"]) - pos_len
+    batch = {k: v for k, v in batch.items()}
+    itm_labels = torch.cat([torch.ones(pos_len), torch.zeros(neg_len)]).to(
+        pl_module.device
+    )
+    itm_labels = itm_labels[torch.randperm(itm_labels.size(0))]
+    num_res_factors = len(pl_module.hparams.config['multi_res_factors'])
+    if 'false_image_0' not in batch:
+        if num_res_factors == 0:
+            rand_idx = torch.randperm(len(batch['image'][0]))
+            batch['false_image_0'] = [batch['image'][0][rand_idx]]
+            batch['correct_false'] = (batch['idx_img'] != batch['idx_img'][rand_idx]).long()
+        else:
+            num_image = len(batch['image'][0])
+            shuffle_len = num_image // 2 + 1
+            idx = torch.cat((torch.randperm(shuffle_len), torch.arange(shuffle_len, num_image)))
+            batch['image'] = [batch['image'][0][idx]]
+            for i in range(num_res_factors):
+                k = 'image_{}'.format(i)
+                batch[k] = [batch[k][0][idx]]
+            batch['correct_false'] = (batch['idx_img'] != batch['idx_img'][idx]).long()
+    else:
+        assert num_res_factors == 0
+
+    if 'correct_false' in batch:
+        # we need to overwrite itm_labels
+        # (itm_label, correct_false): (0, 1) -> 1 and -> 0 otherwise
+        itm_labels = 1 - (1 - itm_labels) * batch['correct_false']
+
+    if num_res_factors == 0:
+        itm_images = [
+            torch.stack(
+                [
+                    ti if itm_labels[i] == 1 else fi
+                    for i, (ti, fi) in enumerate(zip(bti, bfi))
+                ]
+            )
+            for bti, bfi in zip(batch["image"], batch["false_image_0"])
+        ]
+        batch["image"] = itm_images
+
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+    for k in ['text_feats', 'image_feats']:
+        infer[k] = infer[k].float()
+
+    #with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
+    itm_logits = pl_module.itm_score(infer["cls_feats"])
+    itm_logits = itm_logits.float()
+    #itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
+    itm_loss = pl_module.itm_loss(itm_logits, itm_labels.long())
+    ret = {'itm_loss': itm_loss}
+
+    if pl_module.hparams.config.get('ema_distill_itm'):
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_infer = pl_module.ma_teacher.infer(batch, mask_text=False, mask_image=False)
+                for k in ['text_feats', 'image_feats']:
+                    ma_infer[k] = ma_infer[k].float()
+                ma_itm_logits = pl_module.ma_teacher.itm_score(ma_infer["cls_feats"])
+                ma_itm_logits = ma_itm_logits.float()
+        ma_itm_loss = torch.nn.functional.kl_div(
+            itm_logits.log_softmax(dim=1),
+            ma_itm_logits.log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        ema_weight = pl_module.hparams.config.get('ema_distill_itm_weight') or 1.
+        ret['ma_itm_loss'] = ma_itm_loss * ema_weight
 
     with torch.cuda.amp.autocast(enabled=False):
         txt_emb, img_emb = infer["text_feats"], infer["image_feats"]
@@ -251,32 +494,20 @@ def compute_itm_wpa(pl_module, batch):
         )
         distance = trace(cost.matmul(T.detach()))
 
+    if pl_module.hparams.config.get('balance_wpa'):
+        from qd.layers.loss import get_balanced_weight
+        weight = get_balanced_weight(
+            distance, alpha=pl_module.hparams.config.get('equal_sce_alpha', 0.5))
+        distance = weight * distance
+
     dist_pos = distance.masked_select(itm_labels == 1)
     dist_neg = distance.masked_select(itm_labels == 0)
     ot_loss = (dist_pos.sum() - dist_neg.sum()) / (dist_pos.size(0) + dist_neg.size(0))
 
-    itm_logits = pl_module.itm_score(infer["cls_feats"])
-    itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
-
-    ret = {
-        "itm_loss": itm_loss,
-        "itm_wpa_loss": 0.1 * ot_loss,
-        "itm_logits": itm_logits,
-        "itm_labels": itm_labels,
-    }
-
-    phase = "train" if pl_module.training else "val"
-    loss = getattr(pl_module, f"{phase}_itm_loss")(ret["itm_loss"])
-    wpa_loss = getattr(pl_module, f"{phase}_itm_wpa_loss")(ret["itm_wpa_loss"])
-    acc = getattr(pl_module, f"{phase}_itm_accuracy")(
-        ret["itm_logits"], ret["itm_labels"]
-    )
-    pl_module.log(f"itm/{phase}/loss", loss)
-    pl_module.log(f"itm/{phase}/wpa_loss", wpa_loss)
-    pl_module.log(f"itm/{phase}/accuracy", acc)
+    wpa_loss_weight = pl_module.hparams.config.get('wpa_loss_weight', 0.1)
+    ret["itm_wpa_loss"] = wpa_loss_weight * ot_loss
 
     return ret
-
 
 def compute_imgcls(pl_module, batch):
     infer = pl_module.infer(batch, mask_text=False, mask_image=False)
@@ -301,13 +532,374 @@ def compute_imgcls(pl_module, batch):
 
     return ret
 
+class VQABinaryLoss(nn.Module):
+    def forward(self, vqa_logits, vqa_targets):
+        return F.binary_cross_entropy_with_logits(vqa_logits, vqa_targets) * vqa_targets.shape[1]  # https://github.com/jnhwkim/ban-vqa/blob/master/train.py#L19
+
+def compute_refcont(pl_module, batch):
+    assert len(pl_module.hparams.config['multi_res_factors']) == 0
+    img = batch['image'][0]
+    feats1 = pl_module.extract_image_feature(
+        img
+    )
+    with torch.no_grad():
+        feats2 = pl_module.extract_image_feature(
+            batch['image2'][0]
+        )
+    align_loss = pl_module.refcont_loss(feats1, feats2)
+    loss_weight = pl_module.hparams.config['refcont_loss_weight']
+    ret = {
+        'refcont_loss': loss_weight * align_loss,
+    }
+    return ret
+
+def compute_simclr(pl_module, batch):
+    assert len(pl_module.hparams.config['multi_res_factors']) == 0
+    img = batch['image'][0]
+    feats1 = pl_module.extract_image_feature(
+        img
+    )
+    feats2 = pl_module.extract_image_feature(
+        batch['image2'][0]
+    )
+    align_loss = pl_module.simclr_loss(feats1, feats2)
+    loss_weight = pl_module.hparams.config['simclr_loss_weight']
+    ret = {
+        'simclr_loss': loss_weight * align_loss,
+    }
+    return ret
+
+def compute_ema_clip(pl_module, batch):
+    infer = pl_module.infer(
+        batch,
+        mask_text=False,
+        mask_image=False,
+        sep_process=True,
+    )
+    with torch.no_grad():
+        # in apex/o2, ma_teacher should be fp32 and we can run it with amp;
+        # in pytorch/amp or fairscale, enable it is also fine
+         with torch.cuda.amp.autocast(enabled=True):
+             ma_infer = pl_module.ma_teacher.infer(
+                 batch,
+                 mask_text=False,
+                 mask_image=False,
+                 sep_process=True,
+             )
+    if pl_module.hparams.config.get('ema_distill_clip'):
+        # we need to first calculate this and ignore to update the queue. so
+        # that the negative queue is the same
+        ma_align_loss = pl_module.clip_align_loss(
+            {
+                'img_feats': ma_infer['image_feats'],
+                'idx_img': batch['idx_img'],
+            },
+            {
+                'text_feats': ma_infer['text_feats'],
+                'input_ids': batch['text_ids'],
+                'origin_input_ids': batch['text_ids'],
+            },
+            ema_image={
+                'img_feats': ma_infer['image_feats'],
+            },
+            ema_text={
+                'text_feats': ma_infer['text_feats'],
+                'input_ids': batch['text_ids'],
+                'origin_input_ids': batch['text_ids'],
+            },
+            return_info=True,
+            ignore_update_queue=True,
+        )
+    align_loss = pl_module.clip_align_loss(
+        {
+            'img_feats': infer['image_feats'],
+            'idx_img': batch['idx_img'],
+        },
+        {
+            'text_feats': infer['text_feats'],
+            'input_ids': batch['text_ids'],
+            'origin_input_ids': batch['text_ids'],
+        },
+        ema_image={
+            'img_feats': ma_infer['image_feats'],
+        },
+        ema_text={
+            'text_feats': ma_infer['text_feats'],
+            'input_ids': batch['text_ids'],
+            'origin_input_ids': batch['text_ids'],
+        },
+        return_info=True,
+    )
+    clip_loss_weight = pl_module.hparams.config['clip_loss_weight']
+    ret = {}
+    ret['eclip_loss'] = clip_loss_weight * align_loss['loss']
+    if pl_module.hparams.config.get('ema_distill_clip'):
+        ma_image_loss = torch.nn.functional.kl_div(
+            align_loss['image_logits'].log_softmax(dim=1),
+            ma_align_loss['image_logits'].log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        ma_text_loss = torch.nn.functional.kl_div(
+            align_loss['text_logits'].log_softmax(dim=1),
+            ma_align_loss['text_logits'].log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config.get('ema_distill_clip_weight') or 1.
+        ret['ma_eclip_loss'] = (ma_image_loss + ma_text_loss) / 2. * weight
+
+    return ret
+
+def compute_fork_ema_clip(pl_module, batch):
+    infer = pl_module.infer(
+        batch,
+        mask_text=False,
+        mask_image=False,
+        no_fuse=True,
+    )
+    with torch.no_grad():
+        # in apex/o2, it should be no harm to wrap it with amp
+        with torch.cuda.amp.autocast(enabled=True):
+            ma_infer = pl_module.ma_teacher.infer(
+                batch,
+                mask_text=False,
+                mask_image=False,
+                no_fuse=True,
+            )
+    align_loss = pl_module.clip_align_loss(
+        {
+            'img_feats': infer['image_embeds'],
+            'idx_img': batch['idx_img'],
+        },
+        {
+            'text_feats': infer['text_embeds'],
+            'input_ids': batch['text_ids'],
+            'origin_input_ids': batch['text_ids'],
+        },
+        ema_image={
+            'img_feats': ma_infer['image_embeds'],
+        },
+        ema_text={
+            'text_feats': ma_infer['text_embeds'],
+            'input_ids': batch['text_ids'],
+            'origin_input_ids': batch['text_ids'],
+        },
+    )
+    clip_loss_weight = pl_module.hparams.config['clip_loss_weight']
+    ret = {
+        'clip_align_loss': clip_loss_weight * align_loss,
+    }
+
+    return ret
+
+def compute_fork_clip(pl_module, batch):
+    infer = pl_module.infer(
+        batch,
+        mask_text=False,
+        mask_image=False,
+        no_fuse=True,
+    )
+    if pl_module.hparams.config['head_amp'] is None:
+        align_loss_info = pl_module.clip_align_loss(
+            {
+                'img_feats': infer['image_embeds'],
+                'idx_img': batch['idx_img'],
+            },
+            {
+                'text_feats': infer['text_embeds'],
+                'input_ids': batch['text_ids'],
+                'origin_input_ids': batch['text_ids'],
+            },
+            return_info=True
+        )
+        align_loss = align_loss_info['loss']
+        clip_loss_weight = pl_module.hparams.config['clip_loss_weight']
+    else:
+        with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
+            align_loss_info = pl_module.clip_align_loss(
+                {
+                    'img_feats': infer['image_embeds'],
+                    'idx_img': batch['idx_img'],
+                },
+                {
+                    'text_feats': infer['text_embeds'],
+                    'input_ids': batch['text_ids'],
+                    'origin_input_ids': batch['text_ids'],
+                },
+                return_info=True
+            )
+            align_loss = align_loss_info['loss']
+            clip_loss_weight = pl_module.hparams.config['clip_loss_weight']
+    ret = {
+        'clip_align_loss': clip_loss_weight * align_loss,
+    }
+    if pl_module.ma_teacher and pl_module.hparams.config.get('ma_teacher_clip'):
+        # not tested here
+        with torch.no_grad():
+            ma_infer = pl_module.ma_teacher.infer(
+                batch,
+                mask_text=False,
+                mask_image=False,
+                no_fuse=True,
+            )
+            ma_align_loss_info = pl_module.ma_teacher.clip_align_loss(
+                {
+                    'img_feats': ma_infer['image_feats'],
+                    'idx_img': batch['idx_img'],
+                },
+                {
+                    'text_feats': ma_infer['text_feats'],
+                    'input_ids': batch['text_ids'],
+                    'origin_input_ids': batch['text_ids'],
+                },
+                return_info=True
+            )
+        ma_clip_loss1 = torch.nn.functional.kl_div(
+            ma_align_loss_info['logits'].log_softmax(dim=1),
+            align_loss_info['logits'].log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        ma_clip_loss2 = torch.nn.functional.kl_div(
+            ma_align_loss_info['logits'].t().log_softmax(dim=1),
+            align_loss_info['logits'].t().log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        from qd.qd_common import get_mpi_size
+        ret['ma_clip_loss'] = get_mpi_size() * clip_loss_weight * (ma_clip_loss1 + ma_clip_loss2) / 2.
+
+    return ret
+
+def compute_clip(pl_module, batch):
+    infer = pl_module.infer(
+        batch,
+        mask_text=False,
+        mask_image=False,
+        sep_process=True,
+    )
+    #with torch.cuda.amp.autocast(enabled=pl_module.hparams.config['head_amp']):
+    align_loss_info = pl_module.clip_align_loss(
+        {
+            'img_feats': infer['image_feats'],
+            'idx_img': batch['idx_img'],
+        },
+        {
+            'text_feats': infer['text_feats'],
+            'input_ids': batch['text_ids'],
+            'origin_input_ids': batch['text_ids'],
+        },
+        return_info=True
+    )
+    align_loss = align_loss_info['loss']
+    clip_loss_weight = pl_module.hparams.config['clip_loss_weight']
+    ret = {
+        'clip_align_loss': clip_loss_weight * align_loss,
+    }
+    if pl_module.ma_teacher and pl_module.hparams.config.get('ema_distill_clip'):
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_infer = pl_module.ma_teacher.infer(
+                    batch,
+                    mask_text=False,
+                    mask_image=False,
+                    sep_process=True,
+                )
+            ma_align_loss_info = pl_module.ma_teacher.clip_align_loss(
+                {
+                    'img_feats': ma_infer['image_feats'],
+                    'idx_img': batch['idx_img'],
+                },
+                {
+                    'text_feats': ma_infer['text_feats'],
+                    'input_ids': batch['text_ids'],
+                    'origin_input_ids': batch['text_ids'],
+                },
+                return_info=True
+            )
+        if pl_module.hparams.config.get('ema_distill_clip_correct_order'):
+            ma_clip_loss1 = torch.nn.functional.kl_div(
+                align_loss_info['logits'].log_softmax(dim=1),
+                ma_align_loss_info['logits'].log_softmax(dim=1),
+                reduction='batchmean',
+                log_target=True,
+            )
+            ma_clip_loss2 = torch.nn.functional.kl_div(
+                align_loss_info['logits'].t().log_softmax(dim=1),
+                ma_align_loss_info['logits'].t().log_softmax(dim=1),
+                reduction='batchmean',
+                log_target=True,
+            )
+        else:
+            ma_clip_loss1 = torch.nn.functional.kl_div(
+                ma_align_loss_info['logits'].log_softmax(dim=1),
+                align_loss_info['logits'].log_softmax(dim=1),
+                reduction='batchmean',
+                log_target=True,
+            )
+            ma_clip_loss2 = torch.nn.functional.kl_div(
+                ma_align_loss_info['logits'].t().log_softmax(dim=1),
+                align_loss_info['logits'].t().log_softmax(dim=1),
+                reduction='batchmean',
+                log_target=True,
+            )
+        from qd.qd_common import get_mpi_size
+        w = pl_module.hparams.config.get('ema_distill_clip_weight') or 1.
+        w *= clip_loss_weight
+        ret['ma_clip_loss'] = get_mpi_size() * w * (ma_clip_loss1 + ma_clip_loss2) / 2.
+
+    return ret
+
+def compute_snli(pl_module, batch):
+    ret = compute_snli_forward(pl_module, batch)
+    if pl_module.ma_teacher:
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_ret = compute_snli_forward(pl_module.ma_teacher, batch)
+        ma_loss = torch.nn.functional.kl_div(
+            ret['snli_logits'].log_softmax(dim=1),
+            ma_ret['snli_logits'].log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config['ema_distill_weight']
+        ret['ma_loss'] = ma_loss * weight
+    return ret
+
+def compute_snli_forward(pl_module, batch):
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+    snli_logits = pl_module.snli_classifier(infer["cls_feats"])
+
+    snli_labels = batch["snli_labels"]
+    snli_labels = torch.tensor(snli_labels).to(pl_module.device).long()
+    snli_loss = F.cross_entropy(snli_logits, snli_labels.view(-1))
+
+    ret = {
+        "snli_loss": snli_loss,
+        "snli_logits": snli_logits,
+    }
+
+    return ret
 
 def compute_vqa(pl_module, batch):
     infer = pl_module.infer(batch, mask_text=False, mask_image=False)
-    vqa_logits = pl_module.vqa_classifier(infer["cls_feats"])
+
+    if pl_module.hparams.config.get('vqa_use_last_token'):
+        num = infer['text_masks'].shape[0]
+        aug_input_ids = torch.cat((
+            infer['text_masks'].int(), torch.zeros((num, 1), device=infer['text_masks'].device, dtype=torch.int)
+        ), dim=1)
+        idx = (aug_input_ids == 0).int().argmax(dim=1) - 1
+
+        text_feats = infer['text_feats']
+        cls_feats = text_feats[torch.arange(len(text_feats)), idx]
+    else:
+        cls_feats = infer["cls_feats"]
+    vqa_logits = pl_module.vqa_classifier(cls_feats)
     vqa_targets = torch.zeros(
         len(vqa_logits), pl_module.hparams.config["vqav2_label_size"]
-    ).to(pl_module.device)
+    ).to(vqa_logits.device)
 
     vqa_labels = batch["vqa_labels"]
     vqa_scores = batch["vqa_scores"]
@@ -316,11 +908,8 @@ def compute_vqa(pl_module, batch):
         for l, s in zip(_label, _score):
             vqa_targets[i, l] = s
 
-    vqa_loss = (
-        F.binary_cross_entropy_with_logits(vqa_logits, vqa_targets)
-        * vqa_targets.shape[1]
-    )  # https://github.com/jnhwkim/ban-vqa/blob/master/train.py#L19
-
+    vqa_logits = vqa_logits.float()
+    vqa_loss = pl_module.vqa_loss(vqa_logits, vqa_targets)
     ret = {
         "vqa_loss": vqa_loss,
         "vqa_logits": vqa_logits,
@@ -329,29 +918,49 @@ def compute_vqa(pl_module, batch):
         "vqa_scores": vqa_scores,
     }
 
-    phase = "train" if pl_module.training else "val"
-    loss = getattr(pl_module, f"{phase}_vqa_loss")(ret["vqa_loss"])
-    score = getattr(pl_module, f"{phase}_vqa_score")(
-        ret["vqa_logits"], ret["vqa_targets"]
-    )
-    pl_module.log(f"vqa/{phase}/loss", loss)
-    pl_module.log(f"vqa/{phase}/score", score)
+    if pl_module.ma_teacher and pl_module.training:
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_infer = pl_module.ma_teacher.infer(batch, mask_text=False, mask_image=False)
+            ma_vqa_logits = pl_module.ma_teacher.vqa_classifier(ma_infer["cls_feats"])
+            ma_vqa_logits = ma_vqa_logits.float()
+        ma_vqa_loss = F.binary_cross_entropy_with_logits(
+            vqa_logits,
+            vqa_targets.sigmoid(),
+        ) * vqa_logits.shape[1]
+        #ma_vqa_loss = torch.nn.functional.kl_div(
+            #vqa_logits.log_softmax(dim=1),
+            #ma_vqa_logits.log_softmax(dim=1),
+            #reduction='batchmean',
+            #log_target=True,
+        #)
+        weight = pl_module.hparams.config.get('ma_vqa_loss_weight', 1)
+        ret['ma_vqa_loss'] = ma_vqa_loss * weight
+
+    #phase = "train" if pl_module.training else "val"
+    #loss = getattr(pl_module, f"{phase}_vqa_loss")(ret["vqa_loss"])
+    #score = getattr(pl_module, f"{phase}_vqa_score")(
+        #ret["vqa_logits"], ret["vqa_targets"]
+    #)
+    #pl_module.log(f"vqa/{phase}/loss", loss)
+    #pl_module.log(f"vqa/{phase}/score", score)
 
     return ret
 
-
-def compute_nlvr2(pl_module, batch):
+def compute_nlvr2_forward(pl_module, batch):
     infer1 = pl_module.infer(
-        batch, mask_text=False, mask_image=False, image_token_type_idx=1
+        batch, mask_text=False, mask_image=False, image_token_type_idx=1,
+        image_key='image_left',
     )
     infer2 = pl_module.infer(
-        batch, mask_text=False, mask_image=False, image_token_type_idx=2
+        batch, mask_text=False, mask_image=False, image_token_type_idx=2,
+        image_key='image_right',
     )
 
     cls_feats = torch.cat([infer1["cls_feats"], infer2["cls_feats"]], dim=-1)
     nlvr2_logits = pl_module.nlvr2_classifier(cls_feats)
 
-    nlvr2_labels = batch["answers"]
+    nlvr2_labels = batch["answer"]
     nlvr2_labels = torch.tensor(nlvr2_labels).to(pl_module.device).long()
     nlvr2_loss = F.cross_entropy(nlvr2_logits, nlvr2_labels)
 
@@ -361,44 +970,24 @@ def compute_nlvr2(pl_module, batch):
         "nlvr2_labels": nlvr2_labels,
     }
 
-    phase = "train" if pl_module.training else "val"
-
-    if phase == "train":
-        loss = getattr(pl_module, f"{phase}_nlvr2_loss")(ret["nlvr2_loss"])
-        acc = getattr(pl_module, f"{phase}_nlvr2_accuracy")(
-            ret["nlvr2_logits"], ret["nlvr2_labels"]
-        )
-        pl_module.log(f"nlvr2/{phase}/loss", loss)
-        pl_module.log(f"nlvr2/{phase}/accuracy", acc)
-    else:
-        dev_batches = [i for i, n in enumerate(batch["table_name"]) if "dev" in n]
-        test_batches = [i for i, n in enumerate(batch["table_name"]) if "test" in n]
-
-        if dev_batches:
-            dev_loss = getattr(pl_module, f"dev_nlvr2_loss")(
-                F.cross_entropy(
-                    ret["nlvr2_logits"][dev_batches], ret["nlvr2_labels"][dev_batches]
-                )
-            )
-            dev_acc = getattr(pl_module, f"dev_nlvr2_accuracy")(
-                ret["nlvr2_logits"][dev_batches], ret["nlvr2_labels"][dev_batches]
-            )
-            pl_module.log(f"nlvr2/dev/loss", dev_loss)
-            pl_module.log(f"nlvr2/dev/accuracy", dev_acc)
-        if test_batches:
-            test_loss = getattr(pl_module, f"test_nlvr2_loss")(
-                F.cross_entropy(
-                    ret["nlvr2_logits"][test_batches], ret["nlvr2_labels"][test_batches]
-                )
-            )
-            test_acc = getattr(pl_module, f"test_nlvr2_accuracy")(
-                ret["nlvr2_logits"][test_batches], ret["nlvr2_labels"][test_batches]
-            )
-            pl_module.log(f"nlvr2/test/loss", test_loss)
-            pl_module.log(f"nlvr2/test/accuracy", test_acc)
-
     return ret
 
+def compute_nlvr2(pl_module, batch):
+    ret = compute_nlvr2_forward(pl_module, batch)
+    if pl_module.ma_teacher:
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=True):
+                ma_ret = compute_nlvr2_forward(pl_module.ma_teacher, batch)
+        ma_loss = torch.nn.functional.kl_div(
+        ret['nlvr2_logits'].log_softmax(dim=1),
+        ma_ret['nlvr2_logits'].log_softmax(dim=1),
+            reduction='batchmean',
+            log_target=True,
+        )
+        weight = pl_module.hparams.config['ema_distill_weight']
+        ret['ma_loss'] = ma_loss * weight
+
+    return ret
 
 def compute_irtr(pl_module, batch):
     is_training_phase = pl_module.training
@@ -574,7 +1163,6 @@ def init_weights(module):
     elif isinstance(module, nn.LayerNorm):
         module.bias.data.zero_()
         module.weight.data.fill_(1.0)
-
     if isinstance(module, nn.Linear) and module.bias is not None:
         module.bias.data.zero_()
 
